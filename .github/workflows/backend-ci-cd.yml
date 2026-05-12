@@ -1,0 +1,165 @@
+name: Backend CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'backend/**'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+      
+      - name: Install Dependencies
+        run: go mod download
+      
+      - name: Run Tests
+        run: go test ./... -v -coverprofile=coverage.out
+        env:
+          REDIS_ENDPOINT: localhost:6379
+          MONGODB_URI: ${{ secrets.TEST_MONGODB_URI }}
+      
+      - name: Code Quality Check
+        uses: golangci/golangci-lint-action@v3
+        with:
+          version: latest
+          working-directory: backend
+      
+      - name: Vulnerability Scan
+        uses: securego/gosec@master
+        with:
+          args: ./...
+  
+  build-and-push:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      
+      - name: Build Docker Image
+        run: |
+          docker build -t ${{ steps.login-ecr.outputs.registry }}/starttech-backend:${{ github.sha }} .
+          docker tag ${{ steps.login-ecr.outputs.registry }}/starttech-backend:${{ github.sha }} \
+            ${{ steps.login-ecr.outputs.registry }}/starttech-backend:latest
+      
+      - name: Scan Docker Image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/starttech-backend:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'HIGH,CRITICAL'
+      
+      - name: Push to ECR
+        run: |
+          docker push ${{ steps.login-ecr.outputs.registry }}/starttech-backend:${{ github.sha }}
+          docker push ${{ steps.login-ecr.outputs.registry }}/starttech-backend:latest
+  
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Deploy to EC2 ASG
+        run: |
+          # Get instance IDs from ASG
+          INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names starttech-backend-asg \
+            --query 'AutoScalingGroups[0].Instances[].InstanceId' \
+            --output text)
+          
+          # Perform rolling update
+          for INSTANCE_ID in $INSTANCE_IDS; do
+            echo "Updating instance: $INSTANCE_ID"
+            
+            # Get instance IP
+            INSTANCE_IP=$(aws ec2 describe-instances \
+              --instance-ids $INSTANCE_ID \
+              --query 'Reservations[0].Instances[0].PrivateIpAddress' \
+              --output text)
+            
+            # Deregister from target group
+            aws elbv2 deregister-targets \
+              --target-group-arn ${{ secrets.TARGET_GROUP_ARN }} \
+              --targets Id=$INSTANCE_ID
+            
+            # Wait for draining
+            sleep 30
+            
+            # Update container
+            ssh -o StrictHostKeyChecking=no ec2-user@$INSTANCE_IP "
+              docker pull ${{ secrets.ECR_REGISTRY }}/starttech-backend:latest
+              docker stop backend || true
+              docker rm backend || true
+              docker run -d --name backend --restart always -p 8080:8080 \
+                -e REDIS_ENDPOINT='${{ secrets.REDIS_ENDPOINT }}' \
+                -e MONGODB_URI='${{ secrets.MONGODB_URI }}' \
+                ${{ secrets.ECR_REGISTRY }}/starttech-backend:latest
+            "
+            
+            # Health check
+            sleep 10
+            curl -f http://$INSTANCE_IP:8080/health || exit 1
+            
+            # Register back to target group
+            aws elbv2 register-targets \
+              --target-group-arn ${{ secrets.TARGET_GROUP_ARN }} \
+              --targets Id=$INSTANCE_ID
+            
+            # Wait before next instance
+            sleep 30
+          done
+      
+      - name: Run Smoke Tests
+        run: |
+          chmod +x scripts/health-check.sh
+          ./scripts/health-check.sh

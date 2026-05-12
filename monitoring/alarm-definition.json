@@ -1,0 +1,35 @@
+{
+  "alarms": [
+    {
+      "AlarmName": "high-cpu",
+      "MetricName": "CPUUtilization",
+      "Namespace": "AWS/EC2",
+      "Statistic": "Average",
+      "Period": 300,
+      "EvaluationPeriods": 2,
+      "Threshold": 80,
+      "ComparisonOperator": "GreaterThanThreshold",
+      "AlarmActions": ["arn:aws:sns:us-east-1:123456789012:starttech-alerts"]
+    },
+    {
+      "AlarmName": "high-5xx-rate",
+      "MetricName": "HTTPCode_Target_5XX_Count",
+      "Namespace": "AWS/ApplicationELB",
+      "Statistic": "Sum",
+      "Period": 60,
+      "EvaluationPeriods": 5,
+      "Threshold": 10,
+      "ComparisonOperator": "GreaterThanThreshold"
+    },
+    {
+      "AlarmName": "redis-cpu-high",
+      "MetricName": "CPUUtilization",
+      "Namespace": "AWS/ElastiCache",
+      "Statistic": "Average",
+      "Period": 300,
+      "EvaluationPeriods": 2,
+      "Threshold": 75,
+      "ComparisonOperator": "GreaterThanThreshold"
+    }
+  ]
+}
